@@ -13,7 +13,7 @@ use chrono::Datelike;
 use clap::Parser;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use codespan_reporting::term::{self, termcolor};
-use comemo::Prehashed;
+use comemo::{Prehashed, TrackedMut, Track};
 use elsa::FrozenVec;
 use memmap2::Mmap;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -216,9 +216,10 @@ fn compile(mut command: CompileSettings) -> StrResult<()> {
     let dest = Ok(command.dest.as_ref().unwrap_or(&parent_dest.join("dest")).to_owned());
 
     //neither reading nor writing are disabled, by default, though they may be, if need be.
+    let mut wp = WriteStorage::default();
 
     // Create the world that serves sources, fonts and files.
-    let mut world = SystemWorld::new(root, dest, &command.font_paths);
+    let mut world = SystemWorld::new(root, dest, &command.font_paths, &mut wp);
 
     // Perform initial compilation.
     let ok = compile_once(&mut world, &command)?;
@@ -374,35 +375,31 @@ fn write(world: &SystemWorld) -> StrResult<()> {
     // Find file
     tracing::info!("Writing result files..");
     let hashes = world.hashes.borrow();
-    for (h, s) in world.paths.borrow().iter() {
-        if s.buffer.is(AccessMode::W) {
-            // Wasteful, do something better (store mode in hashes?)
-            // Also, collision issue maybe? probably not
-            let loc = hashes.iter().find(|(_, v)| match v {
-                Err(_) => false,
-                Ok(v) => v == h,
-            });
-            if let Some((path, _)) = loc {
-                let data = s.buffer.as_write()?.borrow();
-                if data.is_empty() {
-                    // Nothing to write
-                    continue;
-                } else {
-                    // Remember; we aren't interested with order conservation here! what's important is that the data is there.
-                    let buffer: Vec<u8> = data.to_owned();
-                    // Generate file name, and write
-                    tracing::info!(
-                        "Writing file: {}",
-                        path.to_str().unwrap_or("{invalid_name}")
-                    );
-                    fs::write(path, buffer).map_err(|_| {
-                        format!(
-                            "failed to write {} file",
-                            path.file_name()
-                                .map_or("..", |s| s.to_str().unwrap_or("{invalid_name}"))
-                        )
-                    })?;
-                }
+    for (h, s) in world.wpaths.dump() {
+        let loc = hashes.iter().find(|(_, v)| match v {
+            Err(_) => false,
+            Ok(v) => *v == h,
+        });
+        if let Some((path, _)) = loc {
+            let data = s;
+            if data.is_empty() {
+                // Nothing to write
+                continue;
+            } else {
+                // Remember; we aren't interested with order conservation here! what's important is that the data is there.
+                let buffer: Vec<u8> = data.dump();
+                // Generate file name, and write
+                tracing::info!(
+                    "Writing file: {}",
+                    path.to_str().unwrap_or("{invalid_name}")
+                );
+                fs::write(path, buffer).map_err(|_| {
+                    format!(
+                        "failed to write {} file",
+                        path.file_name()
+                            .map_or("..", |s| s.to_str().unwrap_or("{invalid_name}"))
+                    )
+                })?;
             }
         }
     }
@@ -555,7 +552,7 @@ fn fonts(command: FontsSettings) -> StrResult<()> {
 }
 
 /// A world that provides access to the operating system.
-struct SystemWorld {
+struct SystemWorld<'a> {
     root: FileResult<PathBuf>,
     dest: FileResult<PathBuf>,
     library: Prehashed<Library>,
@@ -563,6 +560,7 @@ struct SystemWorld {
     fonts: Vec<FontSlot>,
     hashes: RefCell<HashMap<PathBuf, FileResult<PathHash>>>,
     paths: RefCell<HashMap<PathHash, PathSlot>>,
+    wpaths: TrackedMut<'a, WriteStorage>,
     sources: FrozenVec<Box<Source>>,
     today: Cell<Option<Datetime>>,
     main: SourceId,
@@ -575,42 +573,72 @@ struct FontSlot {
     font: OnceCell<Option<Font>>,
 }
 
+#[derive(Clone,Debug,Default)]
+struct WriteBuffer { //todo: prehashed?
+    ord: Vec<Location>, //Used to have SOME KIND of order stability :)
+    buffer: RefCell<HashMap<Location, Vec<u8>>>, 
+}
+
+impl Hash for WriteBuffer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let h = self.buffer.borrow();
+        for k in &self.ord { //todo! WOOPs! no order!!
+            k.hash(state);
+            h.get(k).unwrap().hash(state);
+        }
+    }
+}
+
+impl WriteBuffer {
+    fn write(&mut self, at: Location, data: Vec<u8>) -> FileResult<()> {
+        let mut a = self.buffer.borrow_mut();
+        if !a.contains_key(&at) {
+            self.ord.push(at);
+        }
+        a.insert(at, data);
+        return Ok(());
+        // self.0.insert(at, data)
+        //     .map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
+    }
+    fn dump(&self) -> Vec<u8> {
+        self.buffer.borrow().values().flat_map(|v| v.clone()).collect()
+        // self.0.iter().flat_map(|(_,v)| v.clone()).collect()
+    }
+    fn is_empty(&self) -> bool {
+        self.buffer.borrow().is_empty()
+    }
+}
+
 /// Holds canonical data for all paths pointing to the same entity.
+#[derive(Default)]
 struct PathSlot {
     source: OnceCell<FileResult<SourceId>>,
-    buffer: Access<OnceCell<FileResult<Buffer>>, RefCell<Vec<u8>>>,
+    buffer: OnceCell<FileResult<Buffer>>,
 }
 
-impl PathSlot {
-    /// Register a new file in read mode.
-    fn read() -> Self {
-        PathSlot {
-            source: OnceCell::default(),
-            buffer: Access::Read(OnceCell::default()),
-        }
+#[derive(Clone, Debug, Default)]
+struct WriteStorage(RefCell<HashMap<PathHash, WriteBuffer>>);
+
+#[comemo::track]
+impl WriteStorage {
+    fn write(&self, path: PathHash, with: (Location, Vec<u8>)) -> FileResult<()> {
+        self.0.borrow_mut().entry(path).or_default().write(with.0, with.1)
+        // self.0.insert(at, data)
+        //     .map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
     }
-    /// Register a new file in write mode.
-    fn write() -> Self {
-        PathSlot {
-            source: OnceCell::default(),
-            buffer: Access::Write(RefCell::default()),
-        }
-    }
-}
-impl From<AccessMode> for PathSlot {
-    fn from(value: AccessMode) -> Self {
-        match value {
-            AccessMode::R => PathSlot::read(),
-            AccessMode::W => PathSlot::write(),
-        }
+    fn dump(&self) -> Vec<(PathHash, WriteBuffer)> {
+        self.0.borrow().clone().into_iter().collect()
     }
 }
 
-impl SystemWorld {
+
+
+impl<'a> SystemWorld<'a> {
     fn new(
         root: FileResult<PathBuf>,
         dest: FileResult<PathBuf>,
         font_paths: &[PathBuf],
+        wp: &'a mut WriteStorage,
     ) -> Self {
         let mut searcher = FontSearcher::new();
         searcher.search(font_paths);
@@ -623,6 +651,7 @@ impl SystemWorld {
             fonts: searcher.fonts,
             hashes: RefCell::default(),
             paths: RefCell::default(),
+            wpaths: wp.track_mut(),
             sources: FrozenVec::new(),
             today: Cell::new(None),
             main: SourceId::detached(),
@@ -630,7 +659,7 @@ impl SystemWorld {
     }
 }
 
-impl World for SystemWorld {
+impl World for SystemWorld<'_> {
     fn root(&self, mode: AccessMode) -> FileResult<&Path> {
         match mode {
             Access::Read(_) => match &self.root {
@@ -654,7 +683,7 @@ impl World for SystemWorld {
 
     #[tracing::instrument(skip_all)]
     fn resolve(&self, path: &Path) -> FileResult<SourceId> {
-        self.slot(path, AccessMode::R)?
+        self.slot(path)?
             .source
             .get_or_init(|| {
                 let path =
@@ -691,21 +720,18 @@ impl World for SystemWorld {
     }
 
     fn read(&self, path: &Path) -> FileResult<Buffer> {
-        self.slot(path, AccessMode::R)?
+        self.slot(path)?
             .buffer
-            .as_read()?
             .get_or_init(|| read(path).map(Buffer::from))
             .clone()
     }
 
-    fn write(&self, path: &Path, _: Location, what: Vec<u8>) -> FileResult<()> {
+    fn write(&self, path: &Path, at: Location, what: Vec<u8>) -> FileResult<()> {
         //println!("{}", self.slot_w(path)?.buffer.as_write()?.borrow_mut().iter().flat_map(|(_,v)| String::from_utf8(v.to_vec()).unwrap_or("ough".to_owned())).collect::<String>());
-        self.slot(path, AccessMode::W)?
-            .buffer
-            .as_write()?
-            .borrow_mut()
-            .extend(what);
-        Ok(())
+        self.wpaths.write(self.wslot(path)?, (at, what))
+        
+        //    .extend(what);
+        //Ok(())
         //.insert(from, what.into())
         //.map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
     }
@@ -728,14 +754,14 @@ impl World for SystemWorld {
     }
 }
 
-impl SystemWorld {
+impl SystemWorld<'_> {
     #[tracing::instrument(skip_all)]
-    fn slot(&self, path: &Path, mode: AccessMode) -> FileResult<RefMut<PathSlot>> {
+    fn slot(&self, path: &Path) -> FileResult<RefMut<PathSlot>> {
         let mut hashes = self.hashes.borrow_mut();
         let hash = match hashes.get(path).cloned() {
             Some(hash) => hash,
             None => {
-                let hash = PathHash::new(path, mode);
+                let hash = PathHash::new(path, AccessMode::R);
                 if let Ok(canon) = path.canonicalize() {
                     hashes.insert(canon.normalize(), hash.clone());
                 }
@@ -745,8 +771,24 @@ impl SystemWorld {
         }?;
 
         Ok(std::cell::RefMut::map(self.paths.borrow_mut(), |paths| {
-            paths.entry(hash).or_insert(mode.into())
+            paths.entry(hash).or_default()
         }))
+    }
+    fn wslot(&self, path: &Path) -> FileResult<PathHash> {
+        let mut hashes = self.hashes.borrow_mut();
+        let hash = match hashes.get(path).cloned() {
+            Some(hash) => hash,
+            None => {
+                let hash = PathHash::new(path, AccessMode::W);
+                if let Ok(canon) = path.canonicalize() {
+                    hashes.insert(canon.normalize(), hash.clone());
+                }
+                hashes.insert(path.into(), hash.clone());
+                hash
+            }
+        }?;
+
+        Ok(hash)
     }
 
     #[tracing::instrument(skip_all)]
@@ -824,7 +866,7 @@ fn read(path: &Path) -> FileResult<Vec<u8>> {
     }
 }
 
-impl<'a> codespan_reporting::files::Files<'a> for SystemWorld {
+impl<'a> codespan_reporting::files::Files<'a> for SystemWorld<'_> {
     type FileId = SourceId;
     type Name = std::path::Display<'a>;
     type Source = &'a str;
