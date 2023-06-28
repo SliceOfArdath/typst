@@ -60,7 +60,6 @@ use crate::diag::{FileError, FileResult, SourceResult};
 use crate::doc::Document;
 use crate::eval::{Datetime, Library, Route, Tracer};
 use crate::font::{Font, FontBook};
-use crate::model::Location;
 use crate::syntax::{Source, SourceId};
 use crate::util::{AccessMode, Buffer};
 
@@ -121,12 +120,8 @@ pub trait World {
     fn read(&self, path: &Path) -> FileResult<Buffer>;
 
     /// Write or append data to a file at a path.
-    /// The first call to a given path is always a write. All subsequent are append.
-    ///
-    /// Note that there is an issue with this implementation:
-    ///   As location is simply a parameter, anything and anyone may "wear a mustache"
-    ///   and pass as another content element (by stealing its location!)
-    fn write(&self, path: &Path, from: Location, what: Vec<u8>) -> FileResult<()>;
+    /// From is a unique identifier (a hash), and does not indicate any kind of order.
+    fn write(&self, path: &Path, from: u128, what: Vec<u8>) -> FileResult<()>;
 
     /// Get the current date.
     ///

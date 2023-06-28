@@ -2,7 +2,7 @@ mod args;
 mod trace;
 
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::fs::{self, File};
 use std::hash::Hash;
 use std::io::{self, IsTerminal, Write};
@@ -25,7 +25,6 @@ use typst::doc::Document;
 use typst::eval::{Datetime, Library};
 use typst::font::{Font, FontBook, FontInfo, FontVariant};
 use typst::geom::Color;
-use typst::model::Location;
 use typst::syntax::{Source, SourceId};
 use typst::util::{hash128, Access, AccessMode, Buffer, PathExt};
 use typst::World;
@@ -574,35 +573,27 @@ struct FontSlot {
 }
 
 #[derive(Clone,Debug,Default)]
-struct WriteBuffer { //todo: prehashed?
-    ord: Vec<Location>, //Used to have SOME KIND of order stability :)
-    buffer: RefCell<HashMap<Location, Vec<u8>>>, 
+struct WriteBuffer {
+    buffer: RefCell<BTreeMap<u128, Vec<u8>>>, 
 }
 
 impl Hash for WriteBuffer {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let h = self.buffer.borrow();
-        for k in &self.ord { //todo! WOOPs! no order!!
+        for k in h.iter() { //todo! whooops, no order!!
             k.hash(state);
-            h.get(k).unwrap().hash(state);
         }
     }
 }
 
 impl WriteBuffer {
-    fn write(&mut self, at: Location, data: Vec<u8>) -> FileResult<()> {
+    fn write(&mut self, at: u128, data: Vec<u8>) -> FileResult<()> {
         let mut a = self.buffer.borrow_mut();
-        if !a.contains_key(&at) {
-            self.ord.push(at);
-        }
         a.insert(at, data);
         return Ok(());
-        // self.0.insert(at, data)
-        //     .map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
     }
     fn dump(&self) -> Vec<u8> {
         self.buffer.borrow().values().flat_map(|v| v.clone()).collect()
-        // self.0.iter().flat_map(|(_,v)| v.clone()).collect()
     }
     fn is_empty(&self) -> bool {
         self.buffer.borrow().is_empty()
@@ -621,10 +612,8 @@ struct WriteStorage(RefCell<HashMap<PathHash, WriteBuffer>>);
 
 #[comemo::track]
 impl WriteStorage {
-    fn write(&self, path: PathHash, with: (Location, Vec<u8>)) -> FileResult<()> {
+    fn write(&self, path: PathHash, with: (u128, Vec<u8>)) -> FileResult<()> {
         self.0.borrow_mut().entry(path).or_default().write(with.0, with.1)
-        // self.0.insert(at, data)
-        //     .map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
     }
     fn dump(&self) -> Vec<(PathHash, WriteBuffer)> {
         self.0.borrow().clone().into_iter().collect()
@@ -726,14 +715,8 @@ impl World for SystemWorld<'_> {
             .clone()
     }
 
-    fn write(&self, path: &Path, at: Location, what: Vec<u8>) -> FileResult<()> {
-        //println!("{}", self.slot_w(path)?.buffer.as_write()?.borrow_mut().iter().flat_map(|(_,v)| String::from_utf8(v.to_vec()).unwrap_or("ough".to_owned())).collect::<String>());
+    fn write(&self, path: &Path, at: u128, what: Vec<u8>) -> FileResult<()> {
         self.wpaths.write(self.wslot(path)?, (at, what))
-        
-        //    .extend(what);
-        //Ok(())
-        //.insert(from, what.into())
-        //.map_or(FileResult::Err(FileError::AccessDenied), |_| FileResult::Ok(()))
     }
 
     fn today(&self, offset: Option<i64>) -> Option<Datetime> {

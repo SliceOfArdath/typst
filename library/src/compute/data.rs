@@ -1,6 +1,6 @@
 use typst::diag::{format_xml_like_error, FileError};
 use typst::eval::Datetime;
-use typst::util::AccessMode;
+use typst::util::{hash128, AccessMode};
 
 use crate::prelude::*;
 
@@ -65,7 +65,7 @@ pub fn write(
     let Spanned { v: text, span } = text;
     let path = "/record.txt";
     let path = vm.locate(path, AccessMode::W).at(span)?;
-    vm.world().write(&path, location, text.as_bytes().to_vec()).at(span)?;
+    vm.world().write(&path, hash128(&location), text.as_bytes().to_vec()).at(span)?;
     Ok(())
 }
 
@@ -239,6 +239,77 @@ fn convert_json(value: serde_json::Value) -> Value {
             .collect::<Dict>()
             .into_value(),
     }
+}
+
+fn convert_back_json(value: Value) -> StrResult<serde_json::Value> {
+    Ok(match value {
+        Value::None => serde_json::Value::Null,
+        Value::Bool(v) => serde_json::Value::Bool(v),
+        Value::Int(v) => serde_json::Value::Number(serde_json::Number::from(v)),
+        Value::Float(v) => serde_json::Value::Number(
+            serde_json::Number::from_f64(v).ok_or("cannot write NaN or Infinite as json")?),
+        Value::Str(v) => serde_json::Value::String(v.to_string()),
+        Value::Array(v) => {
+            let mut ser_v = Vec::new();
+            for val in v.into_iter() {
+                ser_v.push(convert_back_json(val)?);
+            }
+            serde_json::Value::Array(ser_v)
+        },
+        Value::Dict(v) => {
+            let mut ser_v = serde_json::Map::new();
+            for (s, val) in v.into_iter() {
+                ser_v.insert(s.to_string(), convert_back_json(val)?);
+            }
+            serde_json::Value::Object(ser_v)
+        },
+
+        _ => return Err("unsupported type".into()),
+    })
+}
+
+/// Display: JSON_Write
+/// Category: data-loading
+#[func]
+pub fn write_json(
+    /// Path to a JSON file.
+    path: Spanned<EcoString>,
+    /// The dictionary key.
+    key: Str,
+    /// The data to write.
+    val: Spanned<ToJSON>,
+    /// The virtual machine.
+    vm: &mut Vm,
+) -> SourceResult<()> {
+    let Spanned { v: path, span: p_span } = path;
+    let Spanned { v: val, span: v_span } = val;
+    let path = vm.locate(&path, AccessMode::W).at(p_span)?;
+    let value = convert_back_json(val.0).at(v_span)?;
+    let text = serde_json::to_string(&value).map_err(format_json_error).at(v_span)?;
+    // Do a nasty manual conversion to prefix the key..
+    let text = "\"".to_owned() + &key + "\": " + &text + ",\n"; //TODO :(
+
+    // Not a great way to do this.. 
+    // but writing upon call also means doing it à la state?
+    // or instead, could add a world::create...
+    vm.world().write(&path, u128::MIN, "{".as_bytes().to_vec()).at(p_span)?;
+    vm.world().write(&path, u128::MAX, "}".as_bytes().to_vec()).at(p_span)?;
+
+    vm.world().write(&path, hash128(&key), text.as_bytes().to_vec()).at(p_span)?;
+    Ok(())
+}
+
+pub struct ToJSON(Value);
+
+cast! {
+    ToJSON,
+    _: () => Self(Value::None),
+    v: bool => Self(Value::Bool(v)),
+    v: i64 => Self(Value::Int(v)),
+    v: f64 => Self(Value::Float(v)),
+    v: Str => Self(Value::Str(v)),
+    v: Array => Self(Value::Array(v)),
+    v: Dict => Self(Value::Dict(v)),
 }
 
 /// Format the user-facing JSON error message.
